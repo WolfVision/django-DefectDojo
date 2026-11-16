@@ -1,7 +1,9 @@
 import json
 from datetime import date
+from unittest.mock import Mock, patch
 
 from dojo.models import Test
+from dojo.tools.dependency_track.client import fetch_project_findings
 from dojo.tools.dependency_track.parser import DependencyTrackParser
 from unittests.dojo_test_case import DojoTestCase, get_unit_tests_scans_path
 
@@ -16,6 +18,78 @@ class TestDependencyTrackParser(DojoTestCase):
         finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
 
         self.assertEqual(date(2025, 7, 11), finding.publish_date)
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_fetches_all_pages(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        first = {"matrix": f"{project}:b815b581-fec1-4374-a871-68862a8f8d52:115b80bb-46c4-41d1-9f10-8a175d4abb46"}
+        second = {"matrix": f"{project}:b815b581-fec1-4374-a871-68862a8f8d52:115b80bb-46c4-41d1-9f10-8a175d4abb47"}
+        get.side_effect = [
+            Mock(status_code=200, headers={"X-Total-Count": "2"}, json=Mock(return_value=[first])),
+            Mock(status_code=200, headers={"X-Total-Count": "2"}, json=Mock(return_value=[second])),
+        ]
+
+        findings = fetch_project_findings("https://dependency-track.example", "secret", project, page_size=1)
+
+        self.assertEqual([first, second], findings)
+        self.assertEqual(2, get.call_count)
+        self.assertEqual("true", get.call_args_list[0].kwargs["params"]["suppressed"])
+        self.assertEqual(2, get.call_args_list[1].kwargs["params"]["pageNumber"])
+        self.assertFalse(get.call_args_list[0].kwargs["allow_redirects"])
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_rejects_changing_count(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        finding = {"matrix": f"{project}:b815b581-fec1-4374-a871-68862a8f8d52:115b80bb-46c4-41d1-9f10-8a175d4abb46"}
+        get.side_effect = [
+            Mock(status_code=200, headers={"X-Total-Count": "2"}, json=Mock(return_value=[finding])),
+            Mock(status_code=200, headers={"X-Total-Count": "1"}, json=Mock(return_value=[])),
+        ]
+
+        with self.assertRaises(ValueError):
+            fetch_project_findings("https://dependency-track.example", "secret", project, page_size=1)
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_rejects_incomplete_or_repeated_pages(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        finding = {"matrix": f"{project}:b815b581-fec1-4374-a871-68862a8f8d52:115b80bb-46c4-41d1-9f10-8a175d4abb46"}
+
+        for last_page in ([], [finding]):
+            with self.subTest(last_page=last_page):
+                get.side_effect = [
+                    Mock(status_code=200, headers={"X-Total-Count": "2"}, json=Mock(return_value=[finding])),
+                    Mock(status_code=200, headers={"X-Total-Count": "2"}, json=Mock(return_value=last_page)),
+                ]
+                with self.assertRaises(ValueError):
+                    fetch_project_findings("https://dependency-track.example", "secret", project, page_size=1)
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_rejects_redirects_and_missing_count(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        for response in (
+            Mock(status_code=302),
+            Mock(status_code=200, headers={}, json=Mock(return_value=[])),
+        ):
+            with self.subTest(status=response.status_code):
+                get.return_value = response
+                with self.assertRaises(ValueError):
+                    fetch_project_findings("https://dependency-track.example", "secret", project)
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_accepts_confirmed_empty_project(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        get.return_value = Mock(status_code=200, headers={"X-Total-Count": "0"}, json=Mock(return_value=[]))
+
+        self.assertEqual([], fetch_project_findings("https://dependency-track.example", "secret", project))
+
+    @patch("dojo.tools.dependency_track.client.requests.get")
+    def test_dependency_track_snapshot_rejects_noncanonical_identity(self, get):
+        project = "ca4f2da9-0fad-4a13-92d7-f627f3168a56"
+        finding = {"matrix": f"{project}:B815B581-FEC1-4374-A871-68862A8F8D52:115b80bb-46c4-41d1-9f10-8a175d4abb46"}
+        get.return_value = Mock(status_code=200, headers={"X-Total-Count": "1"}, json=Mock(return_value=[finding]))
+
+        with self.assertRaises(ValueError):
+            fetch_project_findings("https://dependency-track.example", "secret", project)
 
     def test_dependency_track_parser_maps_kev_status(self):
         with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
