@@ -2,6 +2,8 @@ import json
 from datetime import date
 from unittest.mock import Mock, patch
 
+from django.test import override_settings
+
 from dojo.models import Test
 from dojo.tools.dependency_track.client import fetch_project_findings
 from dojo.tools.dependency_track.parser import DependencyTrackParser
@@ -19,6 +21,46 @@ class TestDependencyTrackParser(DojoTestCase):
         finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
 
         self.assertEqual(date(2025, 7, 11), finding.publish_date)
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 42, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    def test_dependency_track_sync_rejects_missing_report(self):
+        parser = DependencyTrackParser()
+
+        with self.assertRaises(ValueError):
+            parser.get_findings(None, Test(engagement_id=42, title="Dependency-Track SCA"))
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 42, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_dependency_track_sync_uses_complete_snapshot(self, fetch):
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            finding_data = json.load(testfile)["findings"][0]
+        finding_data["analysis"] = {"state": "IN_TRIAGE", "isSuppressed": True}
+        finding_data["vulnerability"]["isKev"] = True
+        fetch.return_value = [finding_data]
+
+        parser = DependencyTrackParser()
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            findings = parser.get_findings(testfile, Test(engagement_id=42, title="Dependency-Track SCA"))
+
+        self.assertTrue(parser._dependency_track_sync_enabled)
+        self.assertEqual(1, len(findings))
+        self.assertTrue(findings[0].known_exploited)
+        self.assertTrue(findings[0].under_defect_review)
+        self.assertFalse(findings[0].active)
+        self.assertFalse(findings[0].verified)
+        fetch.assert_called_once_with(
+            "https://dependency-track.example", "secret", "ca4f2da9-0fad-4a13-92d7-f627f3168a56",
+        )
 
     @patch("dojo.tools.dependency_track.client.requests.get")
     def test_dependency_track_snapshot_fetches_all_pages(self, get):

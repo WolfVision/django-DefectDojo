@@ -3,8 +3,9 @@ import logging
 from itertools import batched
 
 from django.conf import settings
-from django.core.exceptions import EmptyResultSet
+from django.core.exceptions import EmptyResultSet, ValidationError
 from django.core.files.uploadedfile import TemporaryUploadedFile
+from django.db.models import Count
 from django.db.models.query_utils import Q
 
 import dojo.finding.helper as finding_helper
@@ -33,6 +34,7 @@ from dojo.models import (
 from dojo.tags import inheritance as tag_inheritance
 from dojo.tags.inheritance import apply_inherited_tags_for_findings
 from dojo.tags.utils import bulk_apply_parser_tags
+from dojo.tools.dependency_track.sync import reconcile_missing_findings, record_source_analysis
 from dojo.utils import perform_product_grading
 from dojo.validators import clean_tags
 
@@ -118,7 +120,36 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         parser = self.get_parser()
         # Get the findings from the parser based on what methods the parser supplies
         # This could either mean traditional file parsing, or API pull parsing
+        bindings = getattr(settings, "DEPENDENCY_TRACK_SYNC_BINDINGS", {})
+        target = {"engagement_id": self.test.engagement_id, "test_title": self.test.title}
+        if self.scan_type == "Dependency Track Finding Packaging Format (FPF) Export" and target in bindings.values():
+            if not settings.SERIALIZE_TEST_IMPORTS:
+                message = "Dependency-Track synchronization requires serialized test imports"
+                raise ValidationError(message)
+            self.lock_test_under_import(self.test)
+            if self.test.pk not in getattr(self, "_import_turn_tests", []):
+                message = "Dependency-Track synchronization could not acquire the test import lock"
+                raise ValidationError(message)
+            if Test.objects.filter(engagement_id=self.test.engagement_id, title=self.test.title, scan_type=self.scan_type).exclude(pk=self.test.pk).exists():
+                message = "Dependency-Track synchronization requires a unique test"
+                raise ValidationError(message)
         parsed_findings = self.parse_findings(scan, parser) or []
+        self._dependency_track_sync_enabled = getattr(parser, "_dependency_track_sync_enabled", False)
+        reconcile_missing = self._dependency_track_sync_enabled and self.close_old_findings_toggle
+        if self._dependency_track_sync_enabled:
+            if self.minimum_severity != "Info":
+                message = "Dependency-Track synchronization requires minimum severity Info"
+                raise ValidationError(message)
+            self.close_old_findings_toggle = False
+            ambiguous = (
+                self.test.finding_set.filter(unique_id_from_tool__startswith=f"{parser.sync_project}:")
+                .values("unique_id_from_tool")
+                .annotate(count=Count("id"))
+                .filter(count__gt=1)
+            )
+            if ambiguous.exists():
+                message = "Dependency-Track test contains ambiguous finding identities"
+                raise ValidationError(message)
         # The excess-duplicate delete leaves the duplicates of a test being imported alone; this
         # one is about to have its findings matched and written, so say so before the first match.
         self.lock_test_under_import(self.test)
@@ -128,6 +159,8 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
             findings_to_mitigate,
             untouched_findings,
         ) = self.process_findings(parsed_findings, **kwargs)
+        if self._dependency_track_sync_enabled:
+            record_source_analysis(self, parser)
         # Close any old findings in the processed list if the the user specified for that
         # to occur in the form that is then passed to the kwargs
         #
@@ -143,6 +176,8 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         # closed_findings by construction, since close_old_findings() no-ops on a finding
         # that is already mitigated by the time it hydrates it.
         closed_finding_ids = [f.id for f in closed_findings] + self.actively_closed_matches
+        if self._dependency_track_sync_enabled:
+            closed_finding_ids.extend(reconcile_missing_findings(self, parser, close_missing=reconcile_missing))
         # Update the timestamps of the test object by looking at the findings imported
         logger.debug("REIMPORT_SCAN: Updating test/engagement timestamps")
         # Update the timestamps of the test object by looking at the findings imported
@@ -332,7 +367,10 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         parsed_findings: list[Finding],
         **kwargs: dict,
     ) -> tuple[list[int], list[int], set[int], set[int]]:
-        self.deduplication_algorithm = self.determine_deduplication_algorithm()
+        self.deduplication_algorithm = (
+            "unique_id_from_tool" if getattr(self, "_dependency_track_sync_enabled", False)
+            else self.determine_deduplication_algorithm()
+        )
         original_findings = self.get_original_findings()
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -469,7 +507,13 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
                     candidates_by_uid=candidates_by_uid,
                     candidates_by_key=candidates_by_key,
                 )
-                matched_findings = self.order_reimport_candidates(unsaved_finding, matched_findings)
+                if hasattr(unsaved_finding, "_dependency_track_analysis"):
+                    matched_findings = [
+                        finding for finding in matched_findings
+                        if finding.unique_id_from_tool == unsaved_finding.unique_id_from_tool
+                    ]
+                else:
+                    matched_findings = self.order_reimport_candidates(unsaved_finding, matched_findings)
                 deduplicationLogger.debug(f"found {len(matched_findings)} findings matching with current new finding")
                 # Determine how to proceed based on whether matches were found or not
                 if matched_findings:
@@ -1132,6 +1176,25 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         Determine how to handle the an existing finding based on the status
         that is possesses at the time of reimport
         """
+        if hasattr(unsaved_finding, "_dependency_track_analysis"):
+            self.unchanged_items.append(existing_finding.id)
+            fields = ["under_defect_review"]
+            if not (existing_finding.duplicate or existing_finding.risk_accepted or existing_finding.out_of_scope):
+                if not (existing_finding.is_mitigated and unsaved_finding.active and self.do_not_reactivate):
+                    fields.extend(["active", "verified", "false_p", "is_mitigated"])
+            changed = False
+            for field in fields:
+                value = getattr(unsaved_finding, field)
+                if getattr(existing_finding, field) != value:
+                    setattr(existing_finding, field, value)
+                    changed = True
+            is_kev = getattr(unsaved_finding, "_dependency_track_kev", None)
+            if is_kev is not None and existing_finding.known_exploited != is_kev:
+                existing_finding.known_exploited = is_kev
+                changed = True
+            if changed and not self.save_matched_finding(existing_finding, no_options=True):
+                return existing_finding, True
+            return existing_finding, False
         if existing_finding.false_p or existing_finding.out_of_scope or existing_finding.risk_accepted:
             return self.process_matched_special_status_finding(
                 unsaved_finding,
@@ -1391,10 +1454,10 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         unsaved_finding.last_reviewed = self.now
         unsaved_finding.last_reviewed_by = self.user
         # indicates an override. Otherwise, do not change the value of unsaved_finding.active
-        if self.active is not None:
+        if self.active is not None and not hasattr(unsaved_finding, "_dependency_track_analysis"):
             unsaved_finding.active = self.active
         # indicates an override. Otherwise, do not change the value of verified
-        if self.verified is not None:
+        if self.verified is not None and not hasattr(unsaved_finding, "_dependency_track_analysis"):
             unsaved_finding.verified = self.verified
         # scan_date was provided, override value from parser
         if self.scan_date_override:

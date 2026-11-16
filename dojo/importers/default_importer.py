@@ -1,6 +1,7 @@
 import logging
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import TemporaryUploadedFile
 from django.db.models.query_utils import Q
 from django.urls import reverse
@@ -22,6 +23,7 @@ from dojo.notifications.helper import async_create_notification
 from dojo.tags import inheritance as tag_inheritance
 from dojo.tags.inheritance import apply_inherited_tags_for_findings
 from dojo.tags.utils import bulk_apply_parser_tags
+from dojo.tools.dependency_track.sync import record_source_analysis
 from dojo.utils import get_full_url, perform_product_grading
 from dojo.validators import clean_tags
 
@@ -113,14 +115,27 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
         self.verify_tool_configuration_from_engagement()
         # Fetch the parser based upon the string version of the scan type
         parser = self.get_parser()
+        bindings = getattr(settings, "DEPENDENCY_TRACK_SYNC_BINDINGS", {})
+        target = {"engagement_id": self.engagement.id, "test_title": self.test_title}
+        if self.scan_type == "Dependency Track Finding Packaging Format (FPF) Export" and target in bindings.values():
+            if Test.objects.filter(engagement=self.engagement, title=self.test_title, scan_type=self.scan_type).exists():
+                message = "Dependency-Track synchronization requires a unique test; use reimport"
+                raise ValidationError(message)
         # Get the findings from the parser based on what methods the parser supplies
         # This could either mean traditional file parsing, or API pull parsing
         # Note: for fresh imports, parse_findings() calls create_test() internally,
         # so self.test is guaranteed to be set after this call.
         parsed_findings = self.parse_findings(scan, parser) or []
+        if getattr(parser, "_dependency_track_sync_enabled", False):
+            if self.minimum_severity != "Info":
+                message = "Dependency-Track synchronization requires minimum severity Info"
+                raise ValidationError(message)
+            self.close_old_findings_toggle = False
         # The excess-duplicate delete leaves the duplicates of a test being imported alone.
         self.lock_test_under_import(self.test)
         new_findings = self.process_findings(parsed_findings, **kwargs)
+        if getattr(parser, "_dependency_track_sync_enabled", False):
+            record_source_analysis(self, parser)
         # Close any old findings in the processed list if the the user specified for that
         # to occur in the form that is then passed to the kwargs
         closed_findings = self.close_old_findings(self.test.finding_set.all(), **kwargs)
@@ -246,10 +261,10 @@ class DefaultImporter(BaseImporter, DefaultImporterOptions):
                 unsaved_finding.last_reviewed = self.now
                 logger.debug("process_parsed_finding: unique_id_from_tool: %s, hash_code: %s, active from report: %s, verified from report: %s", unsaved_finding.unique_id_from_tool, unsaved_finding.hash_code, unsaved_finding.active, unsaved_finding.verified)
                 # indicates an override. Otherwise, do not change the value of unsaved_finding.active
-                if self.active is not None:
+                if self.active is not None and not hasattr(unsaved_finding, "_dependency_track_analysis"):
                     unsaved_finding.active = self.active
                 # indicates an override. Otherwise, do not change the value of verified
-                if self.verified is not None:
+                if self.verified is not None and not hasattr(unsaved_finding, "_dependency_track_analysis"):
                     unsaved_finding.verified = self.verified
                 # scan_date was provided, override value from parser
                 if self.scan_date_override:

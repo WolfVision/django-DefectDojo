@@ -41,6 +41,9 @@ env = environ.FileAwareEnv(
     # Set casting and default values
     DD_SITE_URL=(str, "http://localhost:8080"),
     DD_DEBUG=(bool, False),
+    DD_DEPENDENCY_TRACK_SYNC_URL=(str, ""),
+    DD_DEPENDENCY_TRACK_SYNC_API_KEY=(str, ""),
+    DD_DEPENDENCY_TRACK_SYNC_BINDINGS=(str, "{}"),
     DD_DJANGO_DEBUG_TOOLBAR_ENABLED=(bool, False),
     # django-jsonfield-backport raises a warning that can be ignored,
     # see https://github.com/laymonage/django-jsonfield-backport
@@ -475,6 +478,9 @@ TEST_RUNNER = env("DD_TEST_RUNNER")
 _populate_notifications_settings(env, globals())
 
 TAG_PREFETCHING = env("DD_TAG_PREFETCHING")
+DEPENDENCY_TRACK_SYNC_URL = env("DD_DEPENDENCY_TRACK_SYNC_URL")
+DEPENDENCY_TRACK_SYNC_API_KEY = env("DD_DEPENDENCY_TRACK_SYNC_API_KEY")
+DEPENDENCY_TRACK_SYNC_BINDINGS = json.loads(env("DD_DEPENDENCY_TRACK_SYNC_BINDINGS"))
 # Tag bulk add batch size (used by dojo.tags.utils.bulk_add_tag_to_instances)
 TAG_BULK_ADD_BATCH_SIZE = env("DD_TAG_BULK_ADD_BATCH_SIZE")
 

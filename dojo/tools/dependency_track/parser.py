@@ -4,10 +4,15 @@ import logging
 from datetime import UTC, datetime
 
 from dateutil import parser
+from django.conf import settings
+from django.utils.dateparse import parse_datetime
+from django.utils.timezone import is_aware
 from packaging.version import InvalidVersion, Version
 
 from dojo.location.feature import locations_enabled
 from dojo.models import Finding
+from dojo.tools.dependency_track.client import DependencyTrackSyncError, fetch_project_findings
+from dojo.tools.dependency_track.sync import apply_analysis_status
 from dojo.tools.locations import LocationData
 from dojo.utils import parse_cvss_data
 
@@ -15,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 class DependencyTrackParser:
+
+    def __init__(self):
+        self._dependency_track_sync_enabled = False
+        self.sync_project = None
+        self.sync_timestamp = None
+        self.snapshot_matrices = set()
+        self.snapshot_analysis = {}
 
     def _convert_dependency_track_severity_to_dojo_severity(self, dependency_track_severity):
         """
@@ -312,8 +324,24 @@ class DependencyTrackParser:
 
     def get_findings(self, file, test):
 
+        self._dependency_track_sync_enabled = False
+        self.sync_project = None
+        self.sync_timestamp = None
+        self.snapshot_matrices = set()
+        self.snapshot_analysis = {}
+        bindings = getattr(settings, "DEPENDENCY_TRACK_SYNC_BINDINGS", {})
+        if not isinstance(bindings, dict):
+            message = "Invalid Dependency-Track synchronization bindings"
+            raise DependencyTrackSyncError(message)
+        target = {"engagement_id": test.engagement_id, "test_title": test.title}
+        if list(bindings.values()).count(target) > 1:
+            message = "Dependency-Track test has multiple project bindings"
+            raise DependencyTrackSyncError(message)
         # Exit if file is not provided
         if file is None:
+            if target in bindings.values():
+                message = "Dependency-Track synchronization requires a report"
+                raise DependencyTrackSyncError(message)
             return []
 
         # Load the contents of the JSON file into a dictionary
@@ -323,23 +351,53 @@ class DependencyTrackParser:
         except:
             findings_export_dict = json.loads(data)
 
-        # Exit if file is an empty JSON dictionary
-        if len(findings_export_dict.keys()) == 0:
-            return []
-
-        # Make sure the findings key exists in the dictionary and that it is not null or an empty list
-        # If it is null or an empty list then exit
-        if "findings" not in findings_export_dict or not findings_export_dict["findings"]:
-            return []
+        if not isinstance(findings_export_dict, dict) or not isinstance(findings_export_dict.get("project", {}), dict):
+            message = "Invalid Dependency-Track report"
+            raise DependencyTrackSyncError(message)
+        project = findings_export_dict.get("project", {}).get("uuid")
+        if project is not None and not isinstance(project, str):
+            message = "Invalid Dependency-Track project identity"
+            raise DependencyTrackSyncError(message)
+        binding = bindings.get(project)
+        if binding is None and target in bindings.values():
+            message = "Dependency-Track project does not match the configured test"
+            raise DependencyTrackSyncError(message)
+        if binding is not None:
+            if binding != target:
+                message = "Dependency-Track project does not match the configured test"
+                raise DependencyTrackSyncError(message)
+            meta = findings_export_dict.get("meta")
+            raw_timestamp = meta.get("timestamp") if isinstance(meta, dict) else None
+            timestamp = parse_datetime(raw_timestamp) if isinstance(raw_timestamp, str) else None
+            if timestamp is None or not is_aware(timestamp):
+                message = "Dependency-Track export has no valid timestamp"
+                raise DependencyTrackSyncError(message)
+            api_url = getattr(settings, "DEPENDENCY_TRACK_SYNC_URL", None)
+            api_key = getattr(settings, "DEPENDENCY_TRACK_SYNC_API_KEY", None)
+            if not api_url or not api_key:
+                message = "Dependency-Track synchronization is not configured"
+                raise DependencyTrackSyncError(message)
+            source_findings = fetch_project_findings(api_url, api_key, project)
+            self._dependency_track_sync_enabled = True
+            self.sync_project = project
+            self.sync_timestamp = timestamp
+            self.snapshot_matrices = {finding["matrix"] for finding in source_findings}
+        else:
+            source_findings = findings_export_dict.get("findings") or []
 
         # Start with an empty list of findings
         items = []
 
         # If we have gotten this far then there should be one or more findings
         # Loop through each finding from Dependency Track
-        for dependency_track_finding in findings_export_dict["findings"]:
+        for dependency_track_finding in source_findings:
             # Convert a Dependency Track finding to a DefectDojo finding
             dojo_finding = self._convert_dependency_track_finding_to_dojo_finding(dependency_track_finding, test)
+            if self._dependency_track_sync_enabled:
+                apply_analysis_status(dojo_finding, dependency_track_finding.get("analysis"))
+                self.snapshot_analysis[dependency_track_finding["matrix"]] = dojo_finding._dependency_track_analysis
+                is_kev = dependency_track_finding["vulnerability"].get("isKev")
+                dojo_finding._dependency_track_kev = is_kev if isinstance(is_kev, bool) else None
 
             # Append DefectDojo finding to list
             items.append(dojo_finding)

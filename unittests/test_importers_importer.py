@@ -1,5 +1,10 @@
+import copy
+import json
 import logging
+import tempfile
 import uuid
+from datetime import date
+from pathlib import Path
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -27,7 +32,13 @@ from dojo.tools.gitlab_sast.parser import GitlabSastParser
 from dojo.tools.sarif.parser import SarifParser
 from dojo.utils import get_object_or_none
 
-from .dojo_test_case import DojoAPITestCase, DojoTestCase, get_unit_tests_path, get_unit_tests_scans_path
+from .dojo_test_case import (
+    DojoAPITestCase,
+    DojoTestCase,
+    get_unit_tests_path,
+    get_unit_tests_scans_path,
+    versioned_fixtures,
+)
 from .test_utils import assertImportModelsCreated
 
 logger = logging.getLogger(__name__)
@@ -1815,3 +1826,420 @@ class TestSanitizeSeverity(DojoTestCase):
         finding = Finding(severity="bogus")
         with self.assertRaises(ValidationError):
             self.importer.sanitize_severity(finding)
+
+
+@versioned_fixtures
+@override_settings(SECURE_SSL_REDIRECT=False)
+class TestDependencyTrackSyncImport(DojoAPITestCase):
+    fixtures = ["dojo_testdata.json"]
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_invalid_absence_timestamp_does_not_close_finding(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            source_report = json.load(testfile)
+        fetch.return_value = source_report["findings"]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+        fetch.return_value = []
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=True)
+        finding.finding_meta.filter(name="dependency_track_absent_since").update(value="2018-11-18T23:31:42")
+        source_report["meta"]["timestamp"] = "2018-11-18T23:32:42Z"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            next_scan = Path(temporary_directory) / "next.json"
+            next_scan.write_text(json.dumps(source_report), encoding="utf-8")
+            self.reimport_scan_with_params(test_id, next_scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=True)
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertFalse(finding.is_mitigated)
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_import_rejects_duplicate_bound_test(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            fetch.return_value = json.load(testfile)["findings"]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )
+
+        self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+            expected_http_status_code=400,
+        )
+        self.assertEqual(1, Test.objects.filter(engagement_id=1, title="Dependency-Track SCA", scan_type=scan_type).count())
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reimport_matches_source_identity_when_hash_changes(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            source_finding = json.load(testfile)["findings"][0]
+        fetch.return_value = [source_finding]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+        source_finding["vulnerability"]["aliases"] = [{"cveId": "CVE-2025-1234"}]
+        source_finding["analysis"]["state"] = "EXPLOITABLE"
+
+        with override_settings(DEDUPLICATION_ALGORITHM_PER_PARSER={scan_type: "hash_code"}):
+            self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+
+        self.assertEqual(1, Finding.objects.filter(test_id=test_id).count())
+        finding.refresh_from_db()
+        self.assertTrue(finding.verified)
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reimport_rejects_severity_filtered_snapshot(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            fetch.return_value = json.load(testfile)["findings"]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+
+        self.reimport_scan_with_params(
+            test_id, scan, scan_type=scan_type, minimum_severity="High", expected_http_status_code=400,
+        )
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reimport_does_not_match_different_source_id_by_hash(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            first = json.load(testfile)["findings"][0]
+        second = copy.deepcopy(first)
+        second["component"]["uuid"] = "b815b581-fec1-4374-a871-68862a8f8d53"
+        second["matrix"] = second["matrix"].replace(
+            "b815b581-fec1-4374-a871-68862a8f8d52", second["component"]["uuid"],
+        )
+        second["analysis"]["state"] = "EXPLOITABLE"
+        fetch.return_value = [first]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+
+        fetch.return_value = [first, second]
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+
+        self.assertTrue(Finding.objects.filter(test_id=test_id, unique_id_from_tool=first["matrix"]).exists())
+        self.assertTrue(Finding.objects.filter(test_id=test_id, unique_id_from_tool=second["matrix"]).exists())
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reappearing_finding_resets_absence_when_close_old_disabled(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            source_report = json.load(testfile)
+        source_finding = source_report["findings"][0]
+        fetch.return_value = [source_finding]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+
+        fetch.return_value = []
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=True)
+        fetch.return_value = [source_finding]
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=False)
+
+        fetch.return_value = []
+        source_report["meta"]["timestamp"] = "2018-11-18T23:32:42Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            next_scan = Path(temporary_directory) / "next.json"
+            next_scan.write_text(json.dumps(source_report), encoding="utf-8")
+            self.reimport_scan_with_params(test_id, next_scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=True)
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertFalse(finding.is_mitigated)
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_failed_snapshot_does_not_close_findings(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            fetch.return_value = json.load(testfile)["findings"]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+        fetch.side_effect = ValueError("snapshot unavailable")
+
+        self.reimport_scan_with_params(
+            test_id, scan, scan_type=scan_type, minimum_severity="Info", close_old_findings=True,
+            expected_http_status_code=400,
+        )
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertFalse(finding.is_mitigated)
+        self.assertFalse(finding.finding_meta.filter(name="dependency_track_absent_since").exists())
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reimport_preserves_risk_acceptance_and_syncs_kev(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            source_finding = json.load(testfile)["findings"][0]
+        fetch.return_value = [source_finding]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+        Finding.objects.filter(pk=finding.pk).update(active=False, verified=False, risk_accepted=True, kev_date=date(2025, 1, 1))
+        source_finding["analysis"]["state"] = "EXPLOITABLE"
+        source_finding["vulnerability"]["isKev"] = True
+
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertTrue(finding.risk_accepted)
+        self.assertFalse(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertTrue(finding.known_exploited)
+        self.assertEqual(date(2025, 1, 1), finding.kev_date)
+
+        Finding.objects.filter(pk=finding.pk).update(risk_accepted=False, duplicate=True, active=False, verified=False)
+        source_finding["vulnerability"]["isKev"] = False
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertTrue(finding.duplicate)
+        self.assertFalse(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertFalse(finding.known_exploited)
+        self.assertEqual(date(2025, 1, 1), finding.kev_date)
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+        SERIALIZE_TEST_IMPORTS=False,
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_reimport_requires_serialization(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            fetch.return_value = json.load(testfile)["findings"]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", test_title="Dependency-Track SCA",
+        )["test"]
+
+        self.reimport_scan_with_params(
+            test_id, scan, scan_type=scan_type, minimum_severity="Info", expected_http_status_code=400,
+        )
+
+    @override_settings(
+        DEPENDENCY_TRACK_SYNC_URL="https://dependency-track.example",
+        DEPENDENCY_TRACK_SYNC_API_KEY="secret",
+        DEPENDENCY_TRACK_SYNC_BINDINGS={
+            "ca4f2da9-0fad-4a13-92d7-f627f3168a56": {"engagement_id": 1, "test_title": "Dependency-Track SCA"},
+        },
+    )
+    @patch("dojo.tools.dependency_track.parser.fetch_project_findings")
+    def test_import_and_reimport_follow_source_state(self, fetch):
+        admin = User.objects.get(username="admin")
+        admin.usercontactinfo.block_execution = True
+        admin.usercontactinfo.save()
+        self.login_as_admin()
+        scan = get_unit_tests_scans_path("dependency_track") / "one_finding.json"
+        with scan.open(encoding="utf-8") as testfile:
+            source_report = json.load(testfile)
+        source_finding = source_report["findings"][0]
+        source_finding["analysis"] = {"state": "IN_TRIAGE", "isSuppressed": False}
+        source_finding["vulnerability"]["isKev"] = False
+        fetch.return_value = [source_finding]
+        scan_type = "Dependency Track Finding Packaging Format (FPF) Export"
+
+        test_id = self.import_scan_with_params(
+            scan, scan_type=scan_type, minimum_severity="Info", active=True, verified=True,
+            test_title="Dependency-Track SCA",
+        )["test"]
+        finding = Finding.objects.get(test_id=test_id)
+        self.assertTrue(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertTrue(finding.under_defect_review)
+        analysis = json.loads(finding.finding_meta.get(name="dependency_track_analysis").value)
+        self.assertEqual("IN_TRIAGE", analysis["state"])
+        self.assertFalse(analysis["isSuppressed"])
+
+        source_finding["analysis"]["state"] = "EXPLOITABLE"
+        source_finding["vulnerability"]["isKev"] = True
+        self.reimport_scan_with_params(
+            test_id, scan, scan_type=scan_type, minimum_severity="Info", active=True, verified=True,
+        )
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertTrue(finding.verified)
+        self.assertFalse(finding.under_defect_review)
+        self.assertTrue(finding.known_exploited)
+        analysis = json.loads(finding.finding_meta.get(name="dependency_track_analysis").value)
+        self.assertEqual("EXPLOITABLE", analysis["state"])
+
+        source_finding["analysis"] = {"state": "IN_TRIAGE", "isSuppressed": True}
+        del source_finding["vulnerability"]["isKev"]
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertFalse(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertTrue(finding.under_defect_review)
+        self.assertTrue(finding.known_exploited)
+        analysis = json.loads(finding.finding_meta.get(name="dependency_track_analysis").value)
+        self.assertTrue(analysis["isSuppressed"])
+
+        source_finding["analysis"] = {"state": "FALSE_POSITIVE", "isSuppressed": False}
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertFalse(finding.active)
+        self.assertTrue(finding.false_p)
+        self.assertTrue(finding.is_mitigated)
+        self.assertFalse(finding.under_defect_review)
+
+        source_finding["analysis"] = {"state": "EXPLOITABLE", "isSuppressed": False}
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertTrue(finding.verified)
+        self.assertFalse(finding.false_p)
+        self.assertFalse(finding.is_mitigated)
+
+        source_finding["analysis"]["state"] = "NOT_AFFECTED"
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertFalse(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertFalse(finding.is_mitigated)
+        self.assertFalse(finding.out_of_scope)
+
+        source_finding["analysis"]["state"] = "RESOLVED"
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertFalse(finding.active)
+        self.assertTrue(finding.is_mitigated)
+
+        source_finding["analysis"]["state"] = "EXPLOITABLE"
+        self.reimport_scan_with_params(test_id, scan, scan_type=scan_type, minimum_severity="Info")
+        finding.refresh_from_db()
+        self.assertTrue(finding.active)
+        self.assertTrue(finding.verified)
+        self.assertFalse(finding.is_mitigated)
+
+        fetch.return_value = []
+        for _ in range(2):
+            self.reimport_scan_with_params(
+                test_id, scan, scan_type=scan_type, minimum_severity="Info", active=True, verified=True,
+                close_old_findings=True,
+            )
+            finding.refresh_from_db()
+            self.assertTrue(finding.active)
+            self.assertFalse(finding.is_mitigated)
+
+        source_report["meta"]["timestamp"] = "2018-11-18T23:32:42Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            next_scan = Path(temporary_directory) / "next.json"
+            next_scan.write_text(json.dumps(source_report), encoding="utf-8")
+            self.reimport_scan_with_params(
+                test_id, next_scan, scan_type=scan_type, minimum_severity="Info", active=True, verified=True,
+                close_old_findings=True,
+            )
+        finding.refresh_from_db()
+        self.assertFalse(finding.active)
+        self.assertTrue(finding.is_mitigated)
