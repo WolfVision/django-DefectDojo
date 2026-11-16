@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from dojo.models import Test
 from dojo.tools.dependency_track.client import fetch_project_findings
 from dojo.tools.dependency_track.parser import DependencyTrackParser
+from dojo.tools.dependency_track.sync import apply_analysis_status
 from unittests.dojo_test_case import DojoTestCase, get_unit_tests_scans_path
 
 
@@ -90,6 +91,46 @@ class TestDependencyTrackParser(DojoTestCase):
 
         with self.assertRaises(ValueError):
             fetch_project_findings("https://dependency-track.example", "secret", project)
+
+    def test_dependency_track_analysis_status_mapping(self):
+        states = (
+            (None, True, False, False, False, False),
+            ("NOT_SET", True, False, False, False, False),
+            ("IN_TRIAGE", True, False, False, False, True),
+            ("EXPLOITABLE", True, True, False, False, False),
+            ("FALSE_POSITIVE", False, False, True, True, False),
+            ("NOT_AFFECTED", False, False, False, False, False),
+            ("RESOLVED", False, False, False, True, False),
+        )
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            finding_data = json.load(testfile)["findings"][0]
+        for state, active, verified, false_positive, mitigated, under_review in states:
+            with self.subTest(state=state):
+                finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
+                analysis = {"isSuppressed": False}
+                if state is not None:
+                    analysis["state"] = state
+                apply_analysis_status(finding, analysis)
+                self.assertEqual(active, finding.active)
+                self.assertEqual(verified, finding.verified)
+                self.assertEqual(false_positive, finding.false_p)
+                self.assertEqual(mitigated, finding.is_mitigated)
+                self.assertEqual(under_review, finding.under_defect_review)
+
+    def test_dependency_track_suppressed_finding_is_inactive(self):
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            finding_data = json.load(testfile)["findings"][0]
+        finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
+        apply_analysis_status(finding, {"state": "EXPLOITABLE", "isSuppressed": True})
+
+        self.assertFalse(finding.active)
+        self.assertFalse(finding.verified)
+        self.assertFalse(finding.is_mitigated)
+
+    def test_dependency_track_rejects_invalid_analysis(self):
+        for analysis in ({"state": []}, {"state": "UNKNOWN"}, {"isSuppressed": "false"}):
+            with self.subTest(analysis=analysis), self.assertRaises(ValueError):
+                apply_analysis_status(None, analysis)
 
     def test_dependency_track_parser_maps_kev_status(self):
         with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
