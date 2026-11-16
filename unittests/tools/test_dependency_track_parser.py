@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 from dojo.models import Test
@@ -6,6 +7,26 @@ from unittests.dojo_test_case import DojoTestCase, get_unit_tests_scans_path
 
 
 class TestDependencyTrackParser(DojoTestCase):
+
+    def test_dependency_track_parser_accepts_api_publication_timestamp(self):
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            finding_data = json.load(testfile)["findings"][0]
+        finding_data["vulnerability"]["published"] = 1752192000000
+
+        finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
+
+        self.assertEqual(date(2025, 7, 11), finding.publish_date)
+
+    def test_dependency_track_parser_maps_kev_status(self):
+        with (get_unit_tests_scans_path("dependency_track") / "one_finding.json").open(encoding="utf-8") as testfile:
+            finding_data = json.load(testfile)["findings"][0]
+
+        for is_kev in (True, False):
+            with self.subTest(is_kev=is_kev):
+                finding_data["vulnerability"]["isKev"] = is_kev
+                finding = DependencyTrackParser()._convert_dependency_track_finding_to_dojo_finding(finding_data, Test())
+                self.assertEqual(is_kev, finding.known_exploited)
+                self.assertIsNone(finding.kev_date)
 
     def test_dependency_track_parser_with_empty_list_for_findings_key_has_no_findings(self):
         with (

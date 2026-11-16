@@ -1,6 +1,7 @@
 import contextlib
 import json
 import logging
+from datetime import UTC, datetime
 
 from dateutil import parser
 from packaging.version import InvalidVersion, Version
@@ -278,13 +279,19 @@ class DependencyTrackParser:
         if cvssv4:
             finding.cvssv4 = cvssv4
 
-        if published:
+        if isinstance(published, (int, float)) and not isinstance(published, bool):
+            finding.publish_date = datetime.fromtimestamp(published / 1000, tz=UTC).date()
+        elif published:
             finding.publish_date = parser.parse(published).date()
 
         if epss_score:
             finding.epss_score = epss_score
         if epss_percentile:
             finding.epss_percentile = epss_percentile
+
+        is_kev = dependency_track_finding["vulnerability"].get("isKev")
+        if isinstance(is_kev, bool):
+            finding.known_exploited = is_kev
 
         if locations_enabled():
             if component_purl := dependency_track_finding.get("component", {}).get("purl"):
